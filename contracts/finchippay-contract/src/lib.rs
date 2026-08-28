@@ -1649,9 +1649,11 @@ impl FinchippayContract {
             .persistent()
             .get(&DataKey::Version)
             .unwrap_or(CONTRACT_VERSION);
+        let next_ver = current_ver.checked_add(1).expect("version overflow");
+        env.deployer().update_current_contract_wasm(new_wasm_hash.clone());
         env.storage()
             .persistent()
-            .set(&DataKey::Version, &(current_ver + 1));
+            .set(&DataKey::Version, &next_ver);
         bump(&env, &DataKey::Version);
         env.storage()
             .persistent()
@@ -1934,13 +1936,14 @@ impl FinchippayContract {
             status: EmergencyWithdrawalStatus::Pending,
         };
 
+        let next_count = id.checked_add(1).expect("withdrawal count overflow");
         env.storage()
             .persistent()
             .set(&DataKey::EmergencyWithdrawal(id), &withdrawal);
         bump_to_floor(&env, &DataKey::EmergencyWithdrawal(id));
         env.storage()
             .persistent()
-            .set(&DataKey::EmergencyWithdrawalCount, &(id + 1));
+            .set(&DataKey::EmergencyWithdrawalCount, &next_count);
         bump(&env, &DataKey::EmergencyWithdrawalCount);
 
         env.events().publish(
@@ -2283,9 +2286,10 @@ impl FinchippayContract {
             .set(&DataKey::ReceiptRecord(from.clone(), count), &receipt);
         bump_to_floor(&env, &DataKey::ReceiptRecord(from.clone(), count));
 
+        let next_count = count.checked_add(1).expect("receipt count overflow");
         env.storage()
             .persistent()
-            .set(&DataKey::ReceiptCount(from.clone()), &(count + 1));
+            .set(&DataKey::ReceiptCount(from.clone()), &next_count);
         bump(&env, &DataKey::ReceiptCount(from.clone()));
 
         // Increment global receipt count and store index mapping
