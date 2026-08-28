@@ -80,6 +80,9 @@ pub enum ContractError {
     /// Token transfer succeeded but the actual balance did not increase by
     /// the expected amount (possible malicious/fake token contract).
     TransferFailed = 17,
+    /// A value-moving operation was re-entered before its state transition
+    /// completed.
+    ReentrantCall = 18,
 }
 
 // ─── Shared data types ────────────────────────────────────────────────────────
@@ -256,6 +259,12 @@ pub enum DataKey {
     // Multi-sig
     MultiSigCount,
     MultiSig(u32),
+    /// Total funds held by the contract for active custody records, per token.
+    LockedBalance(Address),
+    /// Last observed contract balance, used for custody-accounting diagnostics.
+    LastContractBalance(Address),
+    /// Instance-scoped lock protecting custody transitions from re-entry.
+    TransitionLock,
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -304,6 +313,85 @@ fn require_transfer_succeeded(
     if balance_after < expected_min {
         panic!("TransferFailed");
     }
+
+}
+
+fn locked_balance(env: &Env, token_address: &Address) -> i128 {
+    let key = DataKey::LockedBalance(token_address.clone());
+    let value = env.storage().persistent().get(&key).unwrap_or(0);
+    if env.storage().persistent().has(&key) {
+        bump(env, &key);
+    }
+    value
+}
+
+fn increase_locked_balance(env: &Env, token_address: &Address, amount: i128) {
+    if amount <= 0 {
+        panic!("amount must be positive");
+    }
+    let key = DataKey::LockedBalance(token_address.clone());
+    let updated = locked_balance(env, token_address)
+        .checked_add(amount)
+        .expect("locked balance overflow");
+    env.storage().persistent().set(&key, &updated);
+    bump(env, &key);
+}
+
+fn decrease_locked_balance(env: &Env, token_address: &Address, amount: i128) {
+    if amount <= 0 {
+        panic!("amount must be positive");
+    }
+    let key = DataKey::LockedBalance(token_address.clone());
+    let updated = locked_balance(env, token_address)
+        .checked_sub(amount)
+        .expect("locked balance underflow");
+    env.storage().persistent().set(&key, &updated);
+    bump(env, &key);
+}
+
+fn cache_contract_balance(env: &Env, token_address: &Address, balance: i128) {
+    let key = DataKey::LastContractBalance(token_address.clone());
+    env.storage().persistent().set(&key, &balance);
+    bump(env, &key);
+}
+
+/// Transfer custody funds out of the contract and verify the contract balance
+/// decreased by exactly the requested amount. Callers must update their record
+/// and locked-balance accounting before invoking this helper.
+fn contract_transfer_out(
+    env: &Env,
+    token_address: &Address,
+    to: &Address,
+    amount: &i128,
+) {
+    if *amount <= 0 {
+        panic!("amount must be positive");
+    }
+    let token = get_token_client(env, token_address);
+    let contract = env.current_contract_address();
+    let balance_before = token.balance(&contract);
+    let expected = balance_before.checked_sub(*amount).expect("underflow");
+    cache_contract_balance(env, token_address, expected);
+    token.transfer(&contract, to, amount);
+    let balance_after = token.balance(&contract);
+    if balance_after != expected {
+        panic!("TransferFailed");
+    }
+    cache_contract_balance(env, token_address, balance_after);
+}
+
+fn with_transition_lock<F, R>(env: &Env, f: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    let key = DataKey::TransitionLock;
+    if env.storage().instance().has(&key) {
+        panic!("ReentrantCall");
+    }
+    env.storage().instance().set(&key, &true);
+    let result = f();
+    env.storage().instance().remove(&key);
+    result
 }
 
 /// Check that the contract is not paused. Panics with `ContractPaused` if it is.
@@ -468,27 +556,29 @@ impl FinchippayContract {
 
     /// Admin: upgrade the contract WASM to `new_wasm_hash`.
     ///
-    /// After a successful upgrade the stored version is incremented so off-chain
-    /// indexers can detect the change.
+    /// Upgrades are deliberately gated by the current admin in this checkout.
+    /// The stored version is incremented only after the WASM update succeeds.
     pub fn upgrade(env: Env, admin: Address, new_wasm_hash: BytesN<32>) {
+        require_initialized(&env);
         admin.require_auth();
         let stored = get_admin(&env);
         if admin != stored {
             panic!("Unauthorized");
         }
-        env.deployer().update_current_contract_wasm(new_wasm_hash.clone());
         let current_ver: u32 = env
             .storage()
             .persistent()
             .get(&DataKey::Version)
             .unwrap_or(CONTRACT_VERSION);
+        let next_ver = current_ver.checked_add(1).expect("version overflow");
+        env.deployer().update_current_contract_wasm(new_wasm_hash.clone());
         env.storage()
             .persistent()
-            .set(&DataKey::Version, &(current_ver + 1));
+            .set(&DataKey::Version, &next_ver);
         bump(&env, &DataKey::Version);
         env.events().publish(
             (Symbol::new(&env, "upgraded"),),
-            (current_ver + 1, new_wasm_hash),
+            (next_ver, new_wasm_hash),
         );
     }
 
@@ -503,6 +593,17 @@ impl FinchippayContract {
         amount: i128,
         to: Address,
     ) {
+        with_transition_lock(&env, || Self::rescue_tokens_inner(env, admin, token_address, amount, to));
+    }
+
+    fn rescue_tokens_inner(
+        env: Env,
+        admin: Address,
+        token_address: Address,
+        amount: i128,
+        to: Address,
+    ) {
+        require_initialized(&env);
         admin.require_auth();
         let stored = get_admin(&env);
         if admin != stored {
@@ -512,7 +613,15 @@ impl FinchippayContract {
             panic!("amount must be positive");
         }
         let token = get_token_client(&env, &token_address);
-        token.transfer(&env.current_contract_address(), &to, &amount);
+        let contract = env.current_contract_address();
+        let balance_before = token.balance(&contract);
+        let unlocked = balance_before
+            .checked_sub(locked_balance(&env, &token_address))
+            .expect("locked balance exceeds actual balance");
+        if amount > unlocked {
+            panic!("amount exceeds unlocked balance");
+        }
+        contract_transfer_out(&env, &token_address, &to, &amount);
 
         env.events().publish(
             (Symbol::new(&env, "rescue_tokens"),),
@@ -528,6 +637,10 @@ impl FinchippayContract {
     /// Panics if `amount <= 0`, the contract is paused, or `from` has not
     /// authorised the call.
     pub fn send_tip(env: Env, token_address: Address, from: Address, to: Address, amount: i128, memo: Symbol) {
+        with_transition_lock(&env, || Self::send_tip_inner(env, token_address, from, to, amount, memo));
+    }
+
+    fn send_tip_inner(env: Env, token_address: Address, from: Address, to: Address, amount: i128, memo: Symbol) {
         require_initialized(&env);
         require_not_paused(&env);
         from.require_auth();
@@ -557,9 +670,10 @@ impl FinchippayContract {
             .set(&DataKey::TipTotal(to.clone()), &new_total);
         bump(&env, &DataKey::TipTotal(to.clone()));
 
+        let next_count = count.checked_add(1).expect("tip count overflow");
         env.storage()
             .persistent()
-            .set(&DataKey::TipCount(to.clone()), &(count + 1));
+            .set(&DataKey::TipCount(to.clone()), &next_count);
         bump(&env, &DataKey::TipCount(to.clone()));
 
         let record = TipRecord {
@@ -642,9 +756,10 @@ impl FinchippayContract {
             .set(&DataKey::ReceiptRecord(from.clone(), count), &receipt);
         bump(&env, &DataKey::ReceiptRecord(from.clone(), count));
 
+        let next_count = count.checked_add(1).expect("receipt count overflow");
         env.storage()
             .persistent()
-            .set(&DataKey::ReceiptCount(from.clone()), &(count + 1));
+            .set(&DataKey::ReceiptCount(from.clone()), &next_count);
         bump(&env, &DataKey::ReceiptCount(from.clone()));
 
         env.events()
@@ -689,6 +804,20 @@ impl FinchippayContract {
         release_ledger: u32,
         memo: Symbol,
     ) -> u32 {
+        with_transition_lock(&env, || {
+            Self::create_escrow_inner(env, token_address, from, to, amount, release_ledger, memo)
+        })
+    }
+
+    fn create_escrow_inner(
+        env: Env,
+        token_address: Address,
+        from: Address,
+        to: Address,
+        amount: i128,
+        release_ledger: u32,
+        memo: Symbol,
+    ) -> u32 {
         require_initialized(&env);
         require_not_paused(&env);
         from.require_auth();
@@ -707,13 +836,20 @@ impl FinchippayContract {
         if release_ledger <= env.ledger().sequence() {
             panic!("release_ledger must be in the future");
         }
-        if release_ledger > env.ledger().sequence() + MAX_ESCROW_LEDGERS {
+        let max_release_ledger = env
+            .ledger()
+            .sequence()
+            .checked_add(MAX_ESCROW_LEDGERS)
+            .expect("release ledger overflow");
+        if release_ledger > max_release_ledger {
             panic!("release_ledger is too far in the future");
         }
 
         let token = get_token_client(&env, &token_address);
         let contract_address = env.current_contract_address();
         require_transfer_succeeded(&env, &token, &from, &contract_address, &amount);
+        cache_contract_balance(&env, &token_address, token.balance(&contract_address));
+        increase_locked_balance(&env, &token_address, amount);
 
         let next_id: u32 = env
             .storage()
@@ -734,9 +870,10 @@ impl FinchippayContract {
             .persistent()
             .set(&DataKey::Escrow(next_id), &escrow);
         bump(&env, &DataKey::Escrow(next_id));
+        let next_count = next_id.checked_add(1).expect("escrow count overflow");
         env.storage()
             .persistent()
-            .set(&DataKey::EscrowCount, &(next_id + 1));
+            .set(&DataKey::EscrowCount, &next_count);
         bump(&env, &DataKey::EscrowCount);
 
         // Index escrow under recipient for queries.
@@ -753,7 +890,7 @@ impl FinchippayContract {
         }
 
         env.events().publish(
-            (Symbol::new(&env, "escrow_create"), next_id),
+            (Symbol::new(&env, "escrow_created"), next_id),
             (from.clone(), to.clone(), amount, release_ledger),
         );
         next_id
@@ -763,6 +900,11 @@ impl FinchippayContract {
     /// escrow recipient and the release ledger must have passed.
     /// Returns the remaining escrow amount after the partial claim.
     pub fn claim_escrow_partial(env: Env, id: u32, claim_amount: i128) -> i128 {
+        with_transition_lock(&env, || Self::claim_escrow_partial_inner(env, id, claim_amount))
+    }
+
+    fn claim_escrow_partial_inner(env: Env, id: u32, claim_amount: i128) -> i128 {
+        require_initialized(&env);
         require_not_paused(&env);
         let mut escrow: Escrow = env
             .storage()
@@ -771,6 +913,9 @@ impl FinchippayContract {
             .expect("escrow not found");
         if escrow.status != EscrowStatus::Pending {
             panic!("escrow is not pending");
+        }
+        if escrow.amount <= 0 {
+            panic!("escrow amount must be positive while pending");
         }
         if env.ledger().sequence() < escrow.release_ledger {
             panic!("release_ledger not reached");
@@ -783,23 +928,20 @@ impl FinchippayContract {
             panic!("claim amount exceeds escrow balance");
         }
 
-        let token = get_token_client(&env, &escrow.token);
-        token.transfer(&env.current_contract_address(), &escrow.to, &claim_amount);
-
-        let remaining = escrow.amount - claim_amount;
+        let remaining = escrow.amount.checked_sub(claim_amount).expect("underflow");
         if remaining == 0 {
             escrow.status = EscrowStatus::Released;
-            escrow.amount = 0;
-        } else {
-            escrow.amount = remaining;
         }
+        escrow.amount = remaining;
+        decrease_locked_balance(&env, &escrow.token, claim_amount);
+        contract_transfer_out(&env, &escrow.token, &escrow.to, &claim_amount);
         env.storage()
             .persistent()
             .set(&DataKey::Escrow(id), &escrow);
         bump(&env, &DataKey::Escrow(id));
 
         env.events().publish(
-            (Symbol::new(&env, "escrow_claim_partial"), id),
+            (Symbol::new(&env, "escrow_partial_released"), id),
             (escrow.to.clone(), claim_amount, remaining),
         );
         remaining
@@ -821,6 +963,11 @@ impl FinchippayContract {
 
     /// Recipient claims the escrowed funds after `release_ledger` has passed.
     pub fn claim_escrow(env: Env, id: u32) {
+        with_transition_lock(&env, || Self::claim_escrow_inner(env, id))
+    }
+
+    fn claim_escrow_inner(env: Env, id: u32) {
+        require_initialized(&env);
         require_not_paused(&env);
         let mut escrow: Escrow = env
             .storage()
@@ -830,26 +977,35 @@ impl FinchippayContract {
         if escrow.status != EscrowStatus::Pending {
             panic!("escrow is not pending");
         }
+        if escrow.amount <= 0 {
+            panic!("escrow amount must be positive while pending");
+        }
         if env.ledger().sequence() < escrow.release_ledger {
             panic!("release_ledger not reached");
         }
         escrow.to.require_auth();
 
-        let token = get_token_client(&env, &escrow.token);
-        token.transfer(&env.current_contract_address(), &escrow.to, &escrow.amount);
-
+        let amount = escrow.amount;
         escrow.status = EscrowStatus::Released;
+        decrease_locked_balance(&env, &escrow.token, amount);
+        contract_transfer_out(&env, &escrow.token, &escrow.to, &amount);
+
         env.storage()
             .persistent()
             .set(&DataKey::Escrow(id), &escrow);
         bump(&env, &DataKey::Escrow(id));
 
         env.events()
-            .publish((Symbol::new(&env, "escrow_claim"), id), (escrow.to, escrow.amount));
+            .publish((Symbol::new(&env, "escrow_released"), id), (escrow.to, amount));
     }
 
     /// Payer cancels the escrow before `release_ledger`; funds are returned.
     pub fn cancel_escrow(env: Env, id: u32) {
+        with_transition_lock(&env, || Self::cancel_escrow_inner(env, id))
+    }
+
+    fn cancel_escrow_inner(env: Env, id: u32) {
+        require_initialized(&env);
         require_not_paused(&env);
         let mut escrow: Escrow = env
             .storage()
@@ -864,10 +1020,11 @@ impl FinchippayContract {
         }
         escrow.from.require_auth();
 
-        let token = get_token_client(&env, &escrow.token);
-        token.transfer(&env.current_contract_address(), &escrow.from, &escrow.amount);
-
+        let amount = escrow.amount;
         escrow.status = EscrowStatus::Cancelled;
+        decrease_locked_balance(&env, &escrow.token, amount);
+        contract_transfer_out(&env, &escrow.token, &escrow.from, &amount);
+
         env.storage()
             .persistent()
             .set(&DataKey::Escrow(id), &escrow);
@@ -875,7 +1032,7 @@ impl FinchippayContract {
 
         env.events().publish(
             (Symbol::new(&env, "escrow_cancelled"),),
-            (id, escrow.from, escrow.amount),
+            (id, escrow.from, amount),
         );
     }
 
@@ -913,6 +1070,19 @@ impl FinchippayContract {
         rate_per_ledger: i128,
         deposit: i128,
     ) -> u32 {
+        with_transition_lock(&env, || {
+            Self::open_stream_inner(env, token_address, payer, recipient, rate_per_ledger, deposit)
+        })
+    }
+
+    fn open_stream_inner(
+        env: Env,
+        token_address: Address,
+        payer: Address,
+        recipient: Address,
+        rate_per_ledger: i128,
+        deposit: i128,
+    ) -> u32 {
         require_initialized(&env);
         require_not_paused(&env);
         payer.require_auth();
@@ -936,6 +1106,8 @@ impl FinchippayContract {
         let token = get_token_client(&env, &token_address);
         let contract_address = env.current_contract_address();
         require_transfer_succeeded(&env, &token, &payer, &contract_address, &deposit);
+        cache_contract_balance(&env, &token_address, token.balance(&contract_address));
+        increase_locked_balance(&env, &token_address, deposit);
 
         let id: u32 = env
             .storage()
@@ -956,13 +1128,14 @@ impl FinchippayContract {
         };
         env.storage().persistent().set(&DataKey::Stream(id), &stream);
         bump(&env, &DataKey::Stream(id));
+        let next_count = id.checked_add(1).expect("stream count overflow");
         env.storage()
             .persistent()
-            .set(&DataKey::StreamCount, &(id + 1));
+            .set(&DataKey::StreamCount, &next_count);
         bump(&env, &DataKey::StreamCount);
 
         env.events().publish(
-            (Symbol::new(&env, "stream_open"), id),
+            (Symbol::new(&env, "stream_opened"), id),
             (payer, recipient, rate_per_ledger, deposit),
         );
         id
@@ -973,6 +1146,11 @@ impl FinchippayContract {
     /// Returns the amount claimed. Can be called multiple times as the stream
     /// progresses; the running `claimed` counter prevents double-claiming.
     pub fn claim_stream(env: Env, stream_id: u32, recipient: Address) -> i128 {
+        with_transition_lock(&env, || Self::claim_stream_inner(env, stream_id, recipient))
+    }
+
+    fn claim_stream_inner(env: Env, stream_id: u32, recipient: Address) -> i128 {
+        require_initialized(&env);
         require_not_paused(&env);
         recipient.require_auth();
 
@@ -985,6 +1163,9 @@ impl FinchippayContract {
         if stream.recipient != recipient {
             panic!("only the recipient may claim");
         }
+        if stream.closed {
+            panic!("stream is closed");
+        }
 
         let claimable = Self::_claimable(&env, &stream);
         if claimable == 0 {
@@ -992,16 +1173,16 @@ impl FinchippayContract {
         }
 
         stream.claimed = stream.claimed.checked_add(claimable).expect("overflow");
+        decrease_locked_balance(&env, &stream.token, claimable);
         env.storage()
             .persistent()
             .set(&DataKey::Stream(stream_id), &stream);
         bump(&env, &DataKey::Stream(stream_id));
 
-        let token = get_token_client(&env, &stream.token);
-        token.transfer(&env.current_contract_address(), &recipient, &claimable);
+        contract_transfer_out(&env, &stream.token, &recipient, &claimable);
 
         env.events().publish(
-            (Symbol::new(&env, "stream_claim"), stream_id),
+            (Symbol::new(&env, "stream_claimed"), stream_id),
             (recipient, claimable),
         );
         claimable
@@ -1014,6 +1195,16 @@ impl FinchippayContract {
         payer: Address,
         amount: i128,
     ) {
+        with_transition_lock(&env, || Self::top_up_stream_inner(env, stream_id, payer, amount));
+    }
+
+    fn top_up_stream_inner(
+        env: Env,
+        stream_id: u32,
+        payer: Address,
+        amount: i128,
+    ) {
+        require_initialized(&env);
         require_not_paused(&env);
         payer.require_auth();
         if amount <= 0 {
@@ -1033,14 +1224,17 @@ impl FinchippayContract {
             panic!("stream is closed");
         }
 
+        let new_deposited = stream.deposited.checked_add(amount).expect("overflow");
+        if new_deposited > MAX_STREAM_DEPOSIT {
+            panic!("deposit exceeds maximum after top-up");
+        }
+
         let token = get_token_client(&env, &stream.token);
         let contract_address = env.current_contract_address();
         require_transfer_succeeded(&env, &token, &payer, &contract_address, &amount);
-
-        stream.deposited = stream.deposited.checked_add(amount).expect("overflow");
-        if stream.deposited > MAX_STREAM_DEPOSIT {
-            panic!("deposit exceeds maximum after top-up");
-        }
+        cache_contract_balance(&env, &stream.token, token.balance(&contract_address));
+        stream.deposited = new_deposited;
+        increase_locked_balance(&env, &stream.token, amount);
         env.storage()
             .persistent()
             .set(&DataKey::Stream(stream_id), &stream);
@@ -1057,6 +1251,11 @@ impl FinchippayContract {
     ///
     /// Returns the refund amount sent back to the payer.
     pub fn close_stream(env: Env, stream_id: u32, payer: Address) -> i128 {
+        with_transition_lock(&env, || Self::close_stream_inner(env, stream_id, payer))
+    }
+
+    fn close_stream_inner(env: Env, stream_id: u32, payer: Address) -> i128 {
+        require_initialized(&env);
         require_not_paused(&env);
         payer.require_auth();
 
@@ -1073,17 +1272,12 @@ impl FinchippayContract {
             panic!("stream is already closed");
         }
 
-        let token = get_token_client(&env, &stream.token);
-
         // Pay out any accrued-but-unclaimed tokens to the recipient first.
         let claimable = Self::_claimable(&env, &stream);
         if claimable > 0 {
-            token.transfer(
-                &env.current_contract_address(),
-                &stream.recipient,
-                &claimable,
-            );
             stream.claimed = stream.claimed.checked_add(claimable).expect("overflow");
+            decrease_locked_balance(&env, &stream.token, claimable);
+            contract_transfer_out(&env, &stream.token, &stream.recipient, &claimable);
         }
 
         // Refund the remaining deposit to the payer.
@@ -1092,7 +1286,8 @@ impl FinchippayContract {
             .checked_sub(stream.claimed)
             .expect("underflow");
         if refund > 0 {
-            token.transfer(&env.current_contract_address(), &payer, &refund);
+            decrease_locked_balance(&env, &stream.token, refund);
+            contract_transfer_out(&env, &stream.token, &payer, &refund);
         }
 
         stream.closed = true;
@@ -1102,7 +1297,7 @@ impl FinchippayContract {
         bump(&env, &DataKey::Stream(stream_id));
 
         env.events().publish(
-            (Symbol::new(&env, "stream_close"), stream_id),
+            (Symbol::new(&env, "stream_closed"), stream_id),
             (payer, refund),
         );
         refund
@@ -1115,6 +1310,11 @@ impl FinchippayContract {
     ///
     /// Returns the refund amount sent back to the payer.
     pub fn reject_stream(env: Env, stream_id: u32, recipient: Address) -> i128 {
+        with_transition_lock(&env, || Self::reject_stream_inner(env, stream_id, recipient))
+    }
+
+    fn reject_stream_inner(env: Env, stream_id: u32, recipient: Address) -> i128 {
+        require_initialized(&env);
         require_not_paused(&env);
         recipient.require_auth();
 
@@ -1131,17 +1331,12 @@ impl FinchippayContract {
             panic!("stream is already closed");
         }
 
-        let token = get_token_client(&env, &stream.token);
-
         // Pay accrued tokens to recipient.
         let claimable = Self::_claimable(&env, &stream);
         if claimable > 0 {
-            token.transfer(
-                &env.current_contract_address(),
-                &recipient,
-                &claimable,
-            );
             stream.claimed = stream.claimed.checked_add(claimable).expect("overflow");
+            decrease_locked_balance(&env, &stream.token, claimable);
+            contract_transfer_out(&env, &stream.token, &recipient, &claimable);
         }
 
         // Refund remaining to payer.
@@ -1150,7 +1345,8 @@ impl FinchippayContract {
             .checked_sub(stream.claimed)
             .expect("underflow");
         if refund > 0 {
-            token.transfer(&env.current_contract_address(), &stream.payer, &refund);
+            decrease_locked_balance(&env, &stream.token, refund);
+            contract_transfer_out(&env, &stream.token, &stream.payer, &refund);
         }
 
         stream.closed = true;
@@ -1176,6 +1372,18 @@ impl FinchippayContract {
         current_recipient: Address,
         new_recipient: Address,
     ) {
+        with_transition_lock(&env, || {
+            Self::transfer_stream_inner(env, stream_id, current_recipient, new_recipient)
+        });
+    }
+
+    fn transfer_stream_inner(
+        env: Env,
+        stream_id: u32,
+        current_recipient: Address,
+        new_recipient: Address,
+    ) {
+        require_initialized(&env);
         require_not_paused(&env);
         current_recipient.require_auth();
         if current_recipient == new_recipient {
@@ -1194,17 +1402,16 @@ impl FinchippayContract {
         if stream.closed {
             panic!("stream is closed");
         }
+        if stream.claimed > stream.deposited {
+            panic!("claimed exceeds deposited");
+        }
 
         // Auto-claim accrued tokens for the old recipient before transfer.
         let claimable = Self::_claimable(&env, &stream);
         if claimable > 0 {
-            let token = get_token_client(&env, &stream.token);
-            token.transfer(
-                &env.current_contract_address(),
-                &current_recipient,
-                &claimable,
-            );
             stream.claimed = stream.claimed.checked_add(claimable).expect("overflow");
+            decrease_locked_balance(&env, &stream.token, claimable);
+            contract_transfer_out(&env, &stream.token, &current_recipient, &claimable);
         }
 
         stream.recipient = new_recipient.clone();
@@ -1254,6 +1461,9 @@ impl FinchippayContract {
         if stream.closed {
             return 0;
         }
+        if stream.deposited <= 0 || stream.claimed < 0 || stream.claimed > stream.deposited {
+            panic!("invalid stream amount invariant");
+        }
         let current = env.ledger().sequence();
         let elapsed = current.saturating_sub(stream.start_ledger) as i128;
         let total_streamed = stream
@@ -1261,7 +1471,7 @@ impl FinchippayContract {
             .checked_mul(elapsed)
             .expect("overflow");
         let capped = total_streamed.min(stream.deposited);
-        (capped - stream.claimed).max(0)
+        capped.checked_sub(stream.claimed).expect("claimable underflow")
     }
 
 
@@ -1273,6 +1483,23 @@ impl FinchippayContract {
     ///
     /// Returns the proposal ID.
     pub fn create_multisig(
+        env: Env,
+        token_address: Address,
+        proposer: Address,
+        recipient: Address,
+        amount: i128,
+        threshold: u32,
+        signers: Vec<Address>,
+        expiration_ledger: u32,
+    ) -> u32 {
+        with_transition_lock(&env, || {
+            Self::create_multisig_inner(
+                env, token_address, proposer, recipient, amount, threshold, signers, expiration_ledger,
+            )
+        })
+    }
+
+    fn create_multisig_inner(
         env: Env,
         token_address: Address,
         proposer: Address,
@@ -1320,6 +1547,8 @@ impl FinchippayContract {
         let token = get_token_client(&env, &token_address);
         let contract_address = env.current_contract_address();
         require_transfer_succeeded(&env, &token, &proposer, &contract_address, &amount);
+        cache_contract_balance(&env, &token_address, token.balance(&contract_address));
+        increase_locked_balance(&env, &token_address, amount);
 
         let id: u32 = env
             .storage()
@@ -1343,9 +1572,10 @@ impl FinchippayContract {
             .persistent()
             .set(&DataKey::MultiSig(id), &proposal);
         bump(&env, &DataKey::MultiSig(id));
+        let next_count = id.checked_add(1).expect("multi-sig count overflow");
         env.storage()
             .persistent()
-            .set(&DataKey::MultiSigCount, &(id + 1));
+            .set(&DataKey::MultiSigCount, &next_count);
         bump(&env, &DataKey::MultiSigCount);
 
         env.events().publish(
@@ -1358,6 +1588,11 @@ impl FinchippayContract {
     /// A signer approves proposal `id`. If the approval count reaches `threshold`
     /// the payment is executed immediately within this call.
     pub fn approve_multisig(env: Env, proposal_id: u32, signer: Address) {
+        with_transition_lock(&env, || Self::approve_multisig_inner(env, proposal_id, signer));
+    }
+
+    fn approve_multisig_inner(env: Env, proposal_id: u32, signer: Address) {
+        require_initialized(&env);
         require_not_paused(&env);
         signer.require_auth();
 
@@ -1393,18 +1628,14 @@ impl FinchippayContract {
 
         env.events().publish(
             (Symbol::new(&env, "multisig_approve"), proposal_id),
-            (signer.clone(), proposal.approvals.len() + 1, proposal.threshold),
+            (signer.clone(), proposal.approvals.len(), proposal.threshold),
         );
 
         // Auto-execute if threshold is reached.
         if proposal.approvals.len() >= proposal.threshold {
-            let token = get_token_client(&env, &proposal.token);
-            token.transfer(
-                &env.current_contract_address(),
-                &proposal.recipient,
-                &proposal.amount,
-            );
             proposal.status = MultiSigStatus::Executed;
+            decrease_locked_balance(&env, &proposal.token, proposal.amount);
+            contract_transfer_out(&env, &proposal.token, &proposal.recipient, &proposal.amount);
             env.events().publish(
                 (Symbol::new(&env, "multisig_executed"), proposal_id),
                 (proposal.recipient.clone(), proposal.amount),
@@ -1421,6 +1652,11 @@ impl FinchippayContract {
     /// the proposer. This prevents funds from being locked forever if signers
     /// abandon a proposal.
     pub fn timeout_multisig(env: Env, proposal_id: u32) {
+        with_transition_lock(&env, || Self::timeout_multisig_inner(env, proposal_id));
+    }
+
+    fn timeout_multisig_inner(env: Env, proposal_id: u32) {
+        require_initialized(&env);
         require_not_paused(&env);
         let mut proposal: MultiSigProposal = env
             .storage()
@@ -1438,14 +1674,9 @@ impl FinchippayContract {
             panic!("proposal has not yet expired");
         }
 
-        let token = get_token_client(&env, &proposal.token);
-        token.transfer(
-            &env.current_contract_address(),
-            &proposal.proposer,
-            &proposal.amount,
-        );
-
         proposal.status = MultiSigStatus::Cancelled;
+        decrease_locked_balance(&env, &proposal.token, proposal.amount);
+        contract_transfer_out(&env, &proposal.token, &proposal.proposer, &proposal.amount);
         env.storage()
             .persistent()
             .set(&DataKey::MultiSig(proposal_id), &proposal);
@@ -1459,6 +1690,11 @@ impl FinchippayContract {
 
     /// The proposer cancels the proposal before execution; funds are refunded.
     pub fn cancel_multisig(env: Env, proposal_id: u32, proposer: Address) {
+        with_transition_lock(&env, || Self::cancel_multisig_inner(env, proposal_id, proposer));
+    }
+
+    fn cancel_multisig_inner(env: Env, proposal_id: u32, proposer: Address) {
+        require_initialized(&env);
         require_not_paused(&env);
         proposer.require_auth();
 
@@ -1475,14 +1711,10 @@ impl FinchippayContract {
             panic!("proposal is not pending");
         }
 
-        let token = get_token_client(&env, &proposal.token);
-        token.transfer(
-            &env.current_contract_address(),
-            &proposer,
-            &proposal.amount,
-        );
-
         proposal.status = MultiSigStatus::Cancelled;
+        decrease_locked_balance(&env, &proposal.token, proposal.amount);
+        contract_transfer_out(&env, &proposal.token, &proposer, &proposal.amount);
+
         env.storage()
             .persistent()
             .set(&DataKey::MultiSig(proposal_id), &proposal);
@@ -1552,6 +1784,16 @@ impl FinchippayContract {
         recipients: Vec<Address>,
         amounts: Vec<i128>,
     ) {
+        with_transition_lock(&env, || Self::batch_send_inner(env, token_address, from, recipients, amounts));
+    }
+
+    fn batch_send_inner(
+        env: Env,
+        token_address: Address,
+        from: Address,
+        recipients: Vec<Address>,
+        amounts: Vec<i128>,
+    ) {
         require_initialized(&env);
         require_not_paused(&env);
         from.require_auth();
@@ -1596,9 +1838,10 @@ impl FinchippayContract {
                 .set(&DataKey::TipTotal(to.clone()), &(total.checked_add(amount).expect("overflow")));
             bump(&env, &DataKey::TipTotal(to.clone()));
 
+            let next_count = count.checked_add(1).expect("tip count overflow");
             env.storage()
                 .persistent()
-                .set(&DataKey::TipCount(to.clone()), &(count + 1));
+                .set(&DataKey::TipCount(to.clone()), &next_count);
             bump(&env, &DataKey::TipCount(to.clone()));
 
             let record = TipRecord {
@@ -2608,7 +2851,7 @@ mod tests {
                 ),
                 (
                     contract_id.clone(),
-                    (Symbol::new(&env, "escrow_create"), id).into_val(&env),
+                    (Symbol::new(&env, "escrow_created"), id).into_val(&env),
                     (from.clone(), to.clone(), 200i128, release).into_val(&env),
                 ),
                 (
@@ -2644,7 +2887,7 @@ mod tests {
                 ),
                 (
                     contract_id.clone(),
-                    (Symbol::new(&env, "stream_open"), sid).into_val(&env),
+                    (Symbol::new(&env, "stream_opened"), sid).into_val(&env),
                     (payer.clone(), recipient.clone(), 10i128, 1_000i128).into_val(&env),
                 ),
                 (
