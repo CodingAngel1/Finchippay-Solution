@@ -1936,14 +1936,14 @@ impl FinchippayContract {
             status: EmergencyWithdrawalStatus::Pending,
         };
 
-        let next_count = count.checked_add(1).expect("tip count overflow");
+        let next_count = id.checked_add(1).expect("withdrawal count overflow");
         env.storage()
             .persistent()
             .set(&DataKey::EmergencyWithdrawal(id), &withdrawal);
         bump_to_floor(&env, &DataKey::EmergencyWithdrawal(id));
         env.storage()
             .persistent()
-            .set(&DataKey::EmergencyWithdrawalCount, &(id + 1));
+            .set(&DataKey::EmergencyWithdrawalCount, &next_count);
         bump(&env, &DataKey::EmergencyWithdrawalCount);
 
         env.events().publish(
