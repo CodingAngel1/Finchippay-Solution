@@ -1,3 +1,4 @@
+/* eslint-env jest */
 /**
  * __tests__/federation.test.js
  * Integration tests for federation endpoints per SEP-0002.
@@ -17,7 +18,7 @@ describe("Federation API", () => {
   beforeAll(async () => {
     // Register a test user
     try {
-      usernameService.registerUsername(testUsername, testPublicKey);
+      await usernameService.registerUsername(testUsername, testPublicKey);
     } catch (err) {
       // User might already exist
     }
@@ -27,7 +28,7 @@ describe("Federation API", () => {
     // Clean up
     nock.cleanAll();
     try {
-      usernameService.removeUsername(testUsername);
+      await usernameService.removeUsername(testUsername);
     } catch (err) {
       // User might not exist
     }
@@ -84,7 +85,7 @@ describe("Federation API", () => {
           .query({ q: stellarAddress, type: "name" })
           .expect(404);
 
-        expect(response.body).toHaveProperty("error", "Username not found");
+        expect(response.body.error.details.reason).toBe("Username not found");
       });
 
       it("should return 400 for invalid stellar address format", async () => {
@@ -120,9 +121,8 @@ describe("Federation API", () => {
           .query({ q: externalAddress, type: "name" })
           .expect(502);
 
-        expect(response.body).toHaveProperty(
-          "error",
-          "Invalid Stellar address returned from federation server"
+        expect(response.body.error.details.reason).toBe(
+          "Invalid Stellar address returned from federation server",
         );
       });
     });
@@ -134,28 +134,30 @@ describe("Federation API", () => {
           .query({ q: testPublicKey, type: "id" })
           .expect(200);
 
-        expect(response.body).toHaveProperty("stellar_address", `${testUsername}*stellarfinchippay.io`);
+        expect(response.body).toHaveProperty(
+          "stellar_address",
+          `${testUsername}*stellarfinchippay.io`,
+        );
         expect(response.body).toHaveProperty("account_id", testPublicKey);
       });
 
       it("should return 404 for non-existent account ID", async () => {
-        const unknownPublicKey = "GBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+        const unknownPublicKey =
+          "GBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
 
         const response = await request(app)
           .get("/federation")
           .query({ q: unknownPublicKey, type: "id" })
           .expect(404);
 
-        expect(response.body).toHaveProperty("error", "Account ID not found");
+        expect(response.body.error.details.reason).toBe("Account ID not found");
       });
     });
 
     it("should return 400 for missing parameters", async () => {
-      const response = await request(app)
-        .get("/federation")
-        .expect(400);
+      const response = await request(app).get("/federation").expect(400);
 
-      expect(response.body).toHaveProperty("error", "Missing required parameters: q and type");
+      expect(response.body.error.code).toBe("VAL_MISSING_FIELD");
     });
 
     it("should return 400 for invalid type", async () => {
@@ -164,7 +166,7 @@ describe("Federation API", () => {
         .query({ q: "test", type: "invalid" })
         .expect(400);
 
-      expect(response.body).toHaveProperty("error", "Invalid type parameter. Must be 'name' or 'id'");
+      expect(response.body.error.code).toBe("VAL_INVALID_FEDERATION_TYPE");
     });
   });
 });
